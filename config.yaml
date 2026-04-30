@@ -1,0 +1,121 @@
+# 携程后台 2.0 旅游订单页面。
+order_page_url: "https://bst.ctrip.com/order_list"
+
+storage_state_path: "storage_state.json"
+template_path: "ctrip.xlsx"
+output_path: "new_orders_preview.xlsx"
+result_sheet_name: "ctrip"
+
+browser:
+  headless: true
+  slow_mo_ms: 0
+  timeout_ms: 30000
+
+scraping:
+  max_pages: 100
+  wait_after_search_ms: 1200
+  wait_after_page_ms: 900
+
+filters:
+  exclude_order_statuses:
+    - "已取消"
+    - "全部退订"
+
+dedupe:
+  enabled: true
+  key_fields:
+    - "日期"
+    - "操作人"
+    - "目的地"
+    - "供应商"
+    - "团期"
+    - "人数"
+  prefer_non_cancelled: true
+  skip_existing_template: true
+  existing_key_fields:
+    - "日期"
+    - "操作人"
+    - "供应商"
+    - "团期"
+    - "人数"
+    - "卖价"
+
+selectors:
+  start_date_input: 'input[placeholder="请选择开始时间"]'
+  end_date_input: 'input[placeholder="请选择结束时间"]'
+  search_button: ".search-btn"
+
+  table_headers: ""
+  table_rows: ".tds_list01 > li:not(:first-child)"
+  row_cells: "td, th"
+
+  next_page_button: ".ant-pagination-next"
+  next_page_disabled_attribute: "aria-disabled"
+  next_page_disabled_class: "ant-pagination-disabled"
+  loading_indicator: ".ant-spin-spinning"
+
+excel:
+  template_sheet_name: "ctrip"
+  style_source_row: 20
+
+field_mapping:
+  日期:
+    source: "row_text"
+    regex: '下单时间：([0-9]{4}-[0-9]{2}-[0-9]{2})'
+    type: "date"
+    default: ""
+  操作人:
+    source: "row_text"
+    regex: '操作员：(.+?)\s+下单时间'
+    transform: "operator_short"
+    type: "text"
+    default: ""
+  来源:
+    type: "text"
+    default: ""
+  目的地:
+    selector: ".product-name"
+    transform: "destination"
+    type: "text"
+    default: ""
+  供应商:
+    source: "row_text"
+    regex: '供应商：(.+?)(?:\s+出发日期：|$)'
+    transform: "supplier"
+    type: "text"
+    default: ""
+  团期:
+    source: "row_text"
+    regex: '出发日期：([0-9]{4}-[0-9]{2}-[0-9]{2})'
+    type: "date"
+    default: ""
+  人数:
+    source: "row_text"
+    regex: '人数：(.+?)(?:\s+对客卖价：|$)'
+    type: "people_count"
+    default: ""
+  卖价:
+    source: "row_text"
+    regex: '对客卖价：([0-9,.]+)'
+    type: "number"
+    default: ""
+  优惠后卖价:
+    source: "row_text"
+    regex: '对客卖价：([0-9,.]+)'
+    type: "number"
+    default: ""
+  结算:
+    source: "row_text"
+    regex: '同行价：([0-9,.]+)'
+    type: "number"
+    default: ""
+  加返后结算:
+    source: "row_text"
+    regex: '同行价：([0-9,.]+)'
+    type: "number"
+    default: ""
+  利润:
+    type: "formula"
+  备注:
+    type: "text"
+    default: ""
