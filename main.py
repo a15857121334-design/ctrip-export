@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -44,6 +46,7 @@ class AppConfig:
     template_path: Path
     output_path: Path
     storage_state_path: Path
+    state_path: Path
 
 
 def import_yaml():
@@ -96,6 +99,16 @@ def import_playwright():
     return sync_playwright, PlaywrightTimeoutError
 
 
+def import_xlrd():
+    try:
+        import xlrd  # type: ignore
+    except ImportError as exc:
+        raise ConfigError(
+            "缺少 xlrd，无法读取携程导出的 .xls 文件。请先运行：python -m pip install -r requirements.txt"
+        ) from exc
+    return xlrd
+
+
 def resolve_path(value: str | None, base_dir: Path) -> Path:
     if not value:
         raise ConfigError("配置里的路径不能为空。")
@@ -124,6 +137,7 @@ def load_config(config_file: str | Path = "config.yaml") -> AppConfig:
         template_path=resolve_path(raw.get("template_path"), base_dir),
         output_path=resolve_path(raw.get("output_path"), base_dir),
         storage_state_path=resolve_path(raw.get("storage_state_path"), base_dir),
+        state_path=resolve_path(raw.get("state_path") or "update_state.json", base_dir),
     )
 
 
@@ -163,12 +177,34 @@ def read_mapping(config: AppConfig) -> dict[str, dict[str, Any]]:
     return normalized
 
 
+def read_export_mapping(config: AppConfig) -> dict[str, dict[str, Any]]:
+    mapping = config.raw.get("export_field_mapping") or {}
+    if not isinstance(mapping, dict):
+        raise ConfigError("export_field_mapping 必须是字典。")
+    normalized: dict[str, dict[str, Any]] = {}
+    for header in EXCEL_HEADERS:
+        spec = mapping.get(header, {})
+        if spec is None:
+            spec = {}
+        if not isinstance(spec, dict):
+            raise ConfigError(f"export_field_mapping.{header} 必须是字典。")
+        normalized[header] = spec
+    return normalized
+
+
+def configured_order_source(config: AppConfig) -> str:
+    source = normalize_text(config.raw.get("order_source") or nested(config.raw, "scraping", "source", default="dom"))
+    return source.lower() or "dom"
+
+
 def check_config(config: AppConfig) -> int:
     errors: list[str] = []
     warnings: list[str] = []
     url = config.raw.get("order_page_url")
     selectors = config.raw.get("selectors") or {}
-    field_mapping = read_mapping(config)
+    source = configured_order_source(config)
+    if source not in {"export", "dom", "auto"}:
+        errors.append("order_source 只能是 export、dom 或 auto。")
 
     if is_placeholder_url(url):
         errors.append("order_page_url 仍是占位地址，请改成携程后台订单管理页 URL。")
@@ -181,10 +217,18 @@ def check_config(config: AppConfig) -> int:
             f"尚未保存登录态：{config.storage_state_path}。请先运行 save_login_state.py。"
         )
 
-    required_selectors = ("table_rows",)
-    for key in required_selectors:
-        if not selectors.get(key):
-            errors.append(f"selectors.{key} 不能为空。")
+    if source in {"dom", "auto"}:
+        required_selectors = ("table_rows",)
+        for key in required_selectors:
+            if not selectors.get(key):
+                errors.append(f"selectors.{key} 不能为空。")
+    if source in {"export", "auto"}:
+        if not selectors.get("export_order_button") and not selectors.get("export_order_button_text"):
+            errors.append("导出模式需要 selectors.export_order_button_text 或 selectors.export_order_button。")
+        try:
+            import_xlrd()
+        except ConfigError as exc:
+            warnings.append(str(exc))
 
     date_selectors = ("start_date_input", "end_date_input", "search_button")
     missing_date = [key for key in date_selectors if not selectors.get(key)]
@@ -195,17 +239,23 @@ def check_config(config: AppConfig) -> int:
             + "。脚本会跳过对应动作。"
         )
 
-    for header, spec in field_mapping.items():
+    mapping_for_check = read_export_mapping(config) if source == "export" else read_mapping(config)
+    for header, spec in mapping_for_check.items():
         if spec.get("type") == "formula":
             continue
-        has_source = bool(spec.get("selector") or spec.get("header") or spec.get("source"))
+        has_source = bool(
+            spec.get("selector")
+            or spec.get("header")
+            or spec.get("source")
+            or spec.get("column")
+        )
         has_default = "default" in spec
         if not has_source and not has_default:
             warnings.append(f"字段 {header} 没有 selector/header/default，结果会为空。")
     if not selectors.get("table_headers"):
         header_only = [
             header
-            for header, spec in field_mapping.items()
+            for header, spec in read_mapping(config).items()
             if spec.get("header") and not spec.get("selector") and spec.get("type") != "formula"
         ]
         if header_only:
@@ -219,6 +269,7 @@ def check_config(config: AppConfig) -> int:
     print(f"- 模板文件：{config.template_path}")
     print(f"- 输出文件：{config.output_path}")
     print(f"- 登录态文件：{config.storage_state_path}")
+    print(f"- 更新状态文件：{config.state_path}")
     if warnings:
         print("\n提醒：")
         for item in warnings:
@@ -238,6 +289,290 @@ def require_confirmation(message: str, accepted: set[str] | None = None) -> None
     answer = input("请输入“确认”继续，输入其他内容取消：").strip()
     if answer.lower() not in {value.lower() for value in accepted_values}:
         raise SystemExit("已取消，未写入任何文件。")
+
+
+class TeeWriter:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def start_log_capture(log_file: str | None) -> tuple[Any, Any, Any] | None:
+    if not log_file:
+        return None
+    log_path = Path(log_file)
+    if not log_path.is_absolute():
+        log_path = Path.cwd() / log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = log_path.open("a", encoding="utf-8")
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = TeeWriter(old_stdout, handle)  # type: ignore[assignment]
+    sys.stderr = TeeWriter(old_stderr, handle)  # type: ignore[assignment]
+    print(f"\n===== {datetime.now().isoformat(timespec='seconds')} =====")
+    print(f"日志文件：{log_path}")
+    return handle, old_stdout, old_stderr
+
+
+def stop_log_capture(capture: tuple[Any, Any, Any] | None) -> None:
+    if not capture:
+        return
+    handle, old_stdout, old_stderr = capture
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        handle.close()
+
+
+def load_update_state(config: AppConfig) -> dict[str, Any]:
+    if not config.state_path.exists():
+        return {}
+    try:
+        with config.state_path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except Exception as exc:
+        print(f"- 更新状态文件读取失败，将按未成功处理：{exc}")
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_update_state(config: AppConfig, state: dict[str, Any]) -> None:
+    config.state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = config.state_path.with_suffix(config.state_path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(temp_path, config.state_path)
+
+
+def slot_state_for_day(state: dict[str, Any], target_day: date, slot: str) -> dict[str, Any]:
+    slots = state.get("slots")
+    if not isinstance(slots, dict):
+        return {}
+    day_slots = slots.get(target_day.isoformat())
+    if not isinstance(day_slots, dict):
+        return {}
+    item = day_slots.get(slot)
+    return item if isinstance(item, dict) else {}
+
+
+def slot_state_for_today(state: dict[str, Any], slot: str) -> dict[str, Any]:
+    return slot_state_for_day(state, date.today(), slot)
+
+
+def slot_succeeded_on(config: AppConfig, slot: str, target_day: date) -> bool:
+    return slot_state_for_day(load_update_state(config), target_day, slot).get("status") == "success"
+
+
+def slot_succeeded_today(config: AppConfig, slot: str) -> bool:
+    return slot_succeeded_on(config, slot, date.today())
+
+
+def update_slot_state(
+    config: AppConfig,
+    slot: str,
+    data: dict[str, Any],
+    target_day: date | None = None,
+) -> None:
+    state = load_update_state(config)
+    slots = state.setdefault("slots", {})
+    if not isinstance(slots, dict):
+        slots = {}
+        state["slots"] = slots
+    day_key = (target_day or date.today()).isoformat()
+    day_slots = slots.setdefault(day_key, {})
+    if not isinstance(day_slots, dict):
+        day_slots = {}
+        slots[day_key] = day_slots
+    day_slots[slot] = data
+    if data.get("status") == "success":
+        state["last_success_at"] = data.get("finished_at")
+    else:
+        state["last_failure"] = data
+    save_update_state(config, state)
+
+
+def record_slot_success(
+    config: AppConfig,
+    slot: str,
+    start_date: str,
+    end_date: str,
+    added_rows: int,
+    backup_path: Path | None,
+    backup_created: bool | None,
+    target_day: date | None = None,
+) -> None:
+    update_slot_state(
+        config,
+        slot,
+        {
+            "status": "success",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "start_date": start_date,
+            "end_date": end_date,
+            "added_rows": added_rows,
+            "template_path": str(config.template_path),
+            "backup_path": str(backup_path) if backup_path else "",
+            "backup_created": backup_created,
+        },
+        target_day,
+    )
+    day_text = (target_day or date.today()).isoformat()
+    print(f"- 已记录 {day_text} {slot} 更新成功：{config.state_path}")
+
+
+def record_slot_failure(
+    config: AppConfig | None,
+    slot: str | None,
+    reason: str,
+    target_day: date | None = None,
+) -> None:
+    if not config or not slot:
+        return
+    try:
+        update_slot_state(
+            config,
+            slot,
+            {
+                "status": "failed",
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "reason": reason,
+                "template_path": str(config.template_path),
+            },
+            target_day,
+        )
+        day_text = (target_day or date.today()).isoformat()
+        print(f"- 已记录 {day_text} {slot} 更新失败：{config.state_path}")
+    except Exception as exc:
+        print(f"- 更新状态文件写入失败：{exc}")
+
+
+def parse_clock_time(value: Any, default: str) -> tuple[int, int]:
+    text = normalize_text(value) or default
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        raise ConfigError(f"时间配置格式错误：{text}，应为 HH:MM。")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise ConfigError(f"时间配置超出范围：{text}")
+    return hour, minute
+
+
+def should_run_noon_catchup(config: AppConfig) -> bool:
+    slot = normalize_text(nested(config.raw, "catch_up", "noon_slot", default="noon")) or "noon"
+    if slot_succeeded_today(config, slot):
+        print("- 今天中午更新已经成功，开机补跑无需执行。")
+        return False
+
+    now = datetime.now()
+    due_hour, due_minute = parse_clock_time(
+        nested(config.raw, "catch_up", "noon_due_time", default="12:00"),
+        "12:00",
+    )
+    cutoff_hour, cutoff_minute = parse_clock_time(
+        nested(config.raw, "catch_up", "noon_cutoff_time", default="18:00"),
+        "18:00",
+    )
+    due = now.replace(hour=due_hour, minute=due_minute, second=0, microsecond=0)
+    cutoff = now.replace(hour=cutoff_hour, minute=cutoff_minute, second=0, microsecond=0)
+    if now < due:
+        print("- 当前还没到中午更新时段，开机补跑无需执行。")
+        return False
+    if now >= cutoff:
+        print("- 当前已到或超过晚间更新时段，跳过中午补跑，交给晚间更新处理。")
+        return False
+    print("- 今天中午更新未成功，当前在 18:00 前，开始开机补跑。")
+    return True
+
+
+def startup_catchup_target(config: AppConfig) -> tuple[str, date] | None:
+    noon_slot = normalize_text(nested(config.raw, "catch_up", "noon_slot", default="noon")) or "noon"
+    evening_slot = normalize_text(nested(config.raw, "catch_up", "evening_slot", default="evening")) or "evening"
+    noon_hour, noon_minute = parse_clock_time(
+        nested(config.raw, "catch_up", "noon_due_time", default="12:00"),
+        "12:00",
+    )
+    evening_hour, evening_minute = parse_clock_time(
+        nested(
+            config.raw,
+            "catch_up",
+            "evening_due_time",
+            default=nested(config.raw, "catch_up", "noon_cutoff_time", default="18:00"),
+        ),
+        "18:00",
+    )
+
+    now = datetime.now()
+    today = now.date()
+    today_noon = now.replace(hour=noon_hour, minute=noon_minute, second=0, microsecond=0)
+    today_evening = now.replace(hour=evening_hour, minute=evening_minute, second=0, microsecond=0)
+
+    if today_noon <= now < today_evening:
+        if slot_succeeded_on(config, noon_slot, today):
+            print("- 今天中午更新已经成功，开机补跑无需执行。")
+            return None
+        print("- 今天中午更新未成功，当前在晚间更新前，开始开机补跑。")
+        return noon_slot, today
+
+    if now >= today_evening:
+        if slot_succeeded_on(config, evening_slot, today):
+            print("- 今天晚间更新已经成功，开机补跑无需执行。")
+            return None
+        print("- 今天晚间更新未成功，开始开机补跑。")
+        return evening_slot, today
+
+    yesterday = today - timedelta(days=1)
+    if slot_succeeded_on(config, evening_slot, yesterday):
+        print("- 昨天晚间更新已经成功，开机补跑无需执行。")
+        return None
+    print("- 昨天晚间更新未成功，当前在今天中午更新前，开始开机补跑。")
+    return evening_slot, yesterday
+
+
+def network_available(config: AppConfig) -> bool:
+    host = normalize_text(nested(config.raw, "network", "check_host", default="bst.ctrip.com"))
+    port = int(nested(config.raw, "network", "check_port", default=443))
+    timeout_seconds = int(nested(config.raw, "network", "check_timeout_seconds", default=10))
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_network_if_needed(config: AppConfig, enabled: bool) -> None:
+    if not enabled:
+        return
+    initial_delay = int(nested(config.raw, "network", "startup_delay_seconds", default=120))
+    retry_delays = nested(config.raw, "network", "retry_delays_seconds", default=[120, 300, 600])
+    if not isinstance(retry_delays, list):
+        retry_delays = [120, 300, 600]
+
+    if initial_delay > 0:
+        print(f"- 开机补跑先等待 {initial_delay} 秒，让网络和登录环境稳定。")
+        time.sleep(initial_delay)
+
+    attempts = len(retry_delays) + 1
+    for attempt in range(1, attempts + 1):
+        if network_available(config):
+            print("- 网络检查通过。")
+            return
+        if attempt <= len(retry_delays):
+            delay = int(retry_delays[attempt - 1])
+            print(f"- 网络暂不可用，第 {attempt}/{attempts} 次检查失败，{delay} 秒后重试。")
+            time.sleep(delay)
+
+    raise ConfigError("网络连续检查失败，未更新订单。")
 
 
 def wait_for_page_idle(page: Any, config: AppConfig, after_ms: int | None = None) -> None:
@@ -333,6 +668,26 @@ def exclude_order_statuses(page: Any, config: AppConfig) -> None:
             const clean = (text) => (text || '')
                 .replace(/\\s+/g, '')
                 .replace(/[^\\u4e00-\\u9fa5]/g, '');
+            const wanted = new Set(statuses.map(clean));
+
+            const carriers = Array.from(document.querySelectorAll('label, .ant-checkbox-wrapper, a'))
+                .filter((el) => wanted.has(clean(el.innerText || el.textContent)));
+
+            const checked = (el) => {
+                const input = el.querySelector('input[type="checkbox"], input[type="radio"]');
+                if (input) {
+                    return input.checked;
+                }
+                const className = String(el.className || '');
+                return className.includes('checked') || className.includes('cur');
+            };
+
+            for (const target of carriers) {
+                if (checked(target)) {
+                    target.click();
+                }
+            }
+
             const anchors = Array.from(document.querySelectorAll('a'));
             for (const status of statuses) {
                 const target = anchors.find((a) => clean(a.innerText || a.textContent) === status);
@@ -913,6 +1268,185 @@ def convert_value(value: Any, value_type: str) -> Any:
     return normalize_text(value)
 
 
+def normalize_export_supplier(provider_name: Any, self_operated: Any) -> str:
+    provider = normalize_text(provider_name)
+    self_text = normalize_text(self_operated)
+    if not provider:
+        return ""
+    if "携程自营" in provider:
+        return "携程自营"
+    is_self_operated = self_text in {"是", "自营", "true", "True", "1", "Y", "yes", "Yes"}
+    if is_self_operated:
+        return f"贴牌自营+{provider}"
+    return normalize_supplier(provider)
+
+
+def export_cell_value(cell: Any, workbook: Any, xlrd: Any) -> Any:
+    if cell.ctype == xlrd.XL_CELL_EMPTY:
+        return ""
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        try:
+            return xlrd.xldate_as_datetime(cell.value, workbook.datemode)
+        except Exception:
+            return cell.value
+    if cell.ctype == xlrd.XL_CELL_NUMBER:
+        number = float(cell.value)
+        return int(number) if number.is_integer() else number
+    return cell.value
+
+
+def read_export_rows(download_path: Path) -> list[dict[str, Any]]:
+    xlrd = import_xlrd()
+    workbook = xlrd.open_workbook(str(download_path))
+    if not workbook.nsheets:
+        return []
+    sheet = workbook.sheet_by_index(0)
+    if sheet.nrows < 1:
+        return []
+    headers = [
+        normalize_text(export_cell_value(sheet.cell(0, col), workbook, xlrd))
+        for col in range(sheet.ncols)
+    ]
+    rows: list[dict[str, Any]] = []
+    for row_index in range(1, sheet.nrows):
+        row: dict[str, Any] = {}
+        for col, header in enumerate(headers):
+            if not header:
+                continue
+            row[header] = export_cell_value(sheet.cell(row_index, col), workbook, xlrd)
+        if any(normalize_text(value) for value in row.values()):
+            rows.append(row)
+    print(f"- 导出文件读取到 {len(rows)} 行订单。")
+    return rows
+
+
+def export_field_raw_value(row: dict[str, Any], spec: dict[str, Any]) -> Any:
+    column = spec.get("column")
+    value = row.get(column, "") if column else ""
+    extra_columns = spec.get("extra_columns") or []
+    if isinstance(extra_columns, list) and extra_columns:
+        parts = [value]
+        parts.extend(row.get(extra_column, "") for extra_column in extra_columns)
+        value = " ".join(normalize_text(part) for part in parts if normalize_text(part))
+    if value in ("", None):
+        value = spec.get("default", "")
+    return value
+
+
+def extract_export_field(row: dict[str, Any], spec: dict[str, Any]) -> Any:
+    transform = spec.get("transform")
+    if transform == "export_supplier":
+        raw_value = normalize_export_supplier(
+            row.get(spec.get("column", ""), ""),
+            row.get(spec.get("self_operated_column", ""), ""),
+        )
+    else:
+        raw_value = export_field_raw_value(row, spec)
+        raw_value = apply_regex(normalize_text(raw_value), spec)
+        raw_value = apply_transform(raw_value, spec)
+    return convert_value(raw_value, spec.get("type", "text"))
+
+
+def export_row_to_order(row: dict[str, Any], config: AppConfig) -> dict[str, Any]:
+    mapping = read_export_mapping(config)
+    order: dict[str, Any] = {}
+    for header in EXCEL_HEADERS:
+        spec = mapping.get(header, {})
+        if spec.get("type") == "formula" or header == "利润":
+            continue
+        order[header] = extract_export_field(row, spec)
+    order["__order_no"] = normalize_text(row.get(nested(config.raw, "export", "order_id_column", default="订单号"), ""))
+    order["__order_status"] = normalize_text(
+        row.get(nested(config.raw, "export", "status_column", default="订单状态"), "")
+    )
+    return order
+
+
+def status_allowed(order: dict[str, Any], config: AppConfig) -> bool:
+    status = normalize_text(order.get("__order_status"))
+    included = nested(config.raw, "filters", "include_order_statuses", default=[])
+    excluded = nested(config.raw, "filters", "exclude_order_statuses", default=[])
+    if status and isinstance(excluded, list) and status in excluded:
+        return False
+    if isinstance(included, list) and included and status:
+        return status in included
+    return True
+
+
+def finalize_orders(orders: list[dict[str, Any]], config: AppConfig) -> list[dict[str, Any]]:
+    before_status = len(orders)
+    orders = [order for order in orders if status_allowed(order, config)]
+    removed_status = before_status - len(orders)
+    if removed_status:
+        print(f"- 已排除已取消/退订等不录入订单 {removed_status} 行。")
+    unique_orders = dedupe_orders(orders, config)
+    return sort_orders_by_order_date(skip_existing_template_orders(unique_orders, config))
+
+
+def click_export_order_button(page: Any, config: AppConfig, timeout_ms: int) -> Any:
+    selectors = config.raw.get("selectors") or {}
+    selector = selectors.get("export_order_button")
+    if selector:
+        locator = page.locator(selector).first
+    else:
+        button_text = selectors.get("export_order_button_text") or "导出订单"
+        locator = page.get_by_text(button_text, exact=True).first
+    locator.wait_for(state="visible", timeout=timeout_ms)
+    locator.click()
+
+
+def export_orders(config: AppConfig, start_date: str, end_date: str) -> list[dict[str, Any]]:
+    url = config.raw.get("order_page_url")
+    if is_placeholder_url(url):
+        raise ConfigError("请先在 config.yaml 中填写真实的 order_page_url。")
+    if not config.storage_state_path.exists():
+        raise ConfigError(
+            f"找不到登录态文件：{config.storage_state_path}。请先运行 save_login_state.py。"
+        )
+
+    # Fail early with a clear message before opening the browser.
+    import_xlrd()
+
+    selectors = config.raw.get("selectors") or {}
+    sync_playwright, _ = import_playwright()
+    timeout_ms = int(nested(config.raw, "browser", "timeout_ms", default=30000))
+    download_timeout_ms = int(nested(config.raw, "export", "download_timeout_ms", default=120000))
+    headless = bool(nested(config.raw, "browser", "headless", default=True))
+    slow_mo_ms = int(nested(config.raw, "browser", "slow_mo_ms", default=0))
+    wait_after_search_ms = int(nested(config.raw, "scraping", "wait_after_search_ms", default=1000))
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+        context = browser.new_context(
+            storage_state=str(config.storage_state_path),
+            accept_downloads=True,
+        )
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            wait_for_page_idle(page, config)
+            set_date_if_configured(page, selectors.get("start_date_input"), start_date, "开始日期", timeout_ms)
+            set_date_if_configured(page, selectors.get("end_date_input"), end_date, "结束日期", timeout_ms)
+            exclude_order_statuses(page, config)
+            clicked = click_if_configured(page, selectors.get("search_button"), "查询按钮", timeout_ms)
+            wait_for_page_idle(page, config, wait_after_search_ms if clicked else None)
+
+            with page.expect_download(timeout=download_timeout_ms) as download_info:
+                click_export_order_button(page, config, timeout_ms)
+            download = download_info.value
+            download_path = download.path()
+            if not download_path:
+                raise ConfigError("携程导出文件下载失败：未取得临时文件路径。")
+            print(f"- 已取得携程导出文件：{download.suggested_filename}")
+            rows = read_export_rows(Path(download_path))
+        finally:
+            context.close()
+            browser.close()
+
+    orders = [export_row_to_order(row, config) for row in rows]
+    return finalize_orders(orders, config)
+
+
 def scrape_orders(config: AppConfig, start_date: str, end_date: str) -> list[dict[str, Any]]:
     url = config.raw.get("order_page_url")
     if is_placeholder_url(url):
@@ -989,8 +1523,20 @@ def scrape_orders(config: AppConfig, start_date: str, end_date: str) -> list[dic
 
         context.close()
         browser.close()
-    unique_orders = dedupe_orders(orders, config)
-    return sort_orders_by_order_date(skip_existing_template_orders(unique_orders, config))
+    return finalize_orders(orders, config)
+
+
+def fetch_orders(config: AppConfig, start_date: str, end_date: str) -> list[dict[str, Any]]:
+    source = configured_order_source(config)
+    if source == "export":
+        return export_orders(config, start_date, end_date)
+    if source == "dom":
+        return scrape_orders(config, start_date, end_date)
+    try:
+        return export_orders(config, start_date, end_date)
+    except ConfigError as exc:
+        print(f"- 导出订单失败，改用页面列表读取：{exc}")
+        return scrape_orders(config, start_date, end_date)
 
 
 def next_button_disabled(button: Any, config: AppConfig) -> bool:
@@ -1284,9 +1830,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recent-days", type=int, help="查询最近 N 天订单，含今天。")
     parser.add_argument("--dry-run", action="store_true", help="只抓取并打印预览，不生成 Excel。")
     parser.add_argument("--check-config", action="store_true", help="只检查配置，不抓取。")
-    parser.add_argument("--update-template", action="store_true", help="把新增订单直接追加到订单.xlsx。")
-    parser.add_argument("--daily-backup", action="store_true", help="更新前按天备份一次订单.xlsx。")
+    parser.add_argument("--update-template", action="store_true", help="把新增订单直接追加到本地订单表。")
+    parser.add_argument("--daily-backup", action="store_true", help="更新前按天备份一次本地订单表。")
     parser.add_argument("--write-preview", action="store_true", help="同时生成 ctrip.xlsx，内容为本次新增订单。")
+    parser.add_argument("--run-slot", choices=("noon", "evening"), help="记录本次自动更新属于中午或晚间。")
+    parser.add_argument("--catch-up-noon", action="store_true", help="兼容旧参数：开机后检查漏跑自动更新。")
+    parser.add_argument("--catch-up-missed", action="store_true", help="开机后检查中午或晚间漏跑，符合时间窗口则补跑一次。")
+    parser.add_argument("--wait-for-network", action="store_true", help="执行前等待并重试网络检查。")
+    parser.add_argument("--log-file", help="把运行输出同时写入指定日志文件。")
     parser.add_argument("--yes", action="store_true", help="跳过写入确认，供定时任务使用。")
     return parser
 
@@ -1294,10 +1845,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    log_capture = start_log_capture(args.log_file)
+    config: AppConfig | None = None
+    slot_for_state: str | None = args.run_slot
+    slot_date_for_state: date | None = None
     try:
         config = load_config(args.config)
         if args.check_config:
             return check_config(config)
+
+        if args.catch_up_noon or args.catch_up_missed:
+            target = startup_catchup_target(config)
+            if not target:
+                return 0
+            slot_for_state, slot_date_for_state = target
+            if not args.recent_days and not args.start_date and not args.end_date:
+                args.recent_days = int(nested(config.raw, "catch_up", "recent_days", default=7))
+            args.update_template = True
+            args.daily_backup = True
+            args.yes = True
+
+        wait_for_network_if_needed(config, args.wait_for_network)
 
         start_date = args.start_date
         end_date = args.end_date
@@ -1312,7 +1880,7 @@ def main(argv: list[str] | None = None) -> int:
         if not start_date or not end_date:
             parser.error("请同时提供 --start-date 和 --end-date，格式 YYYY-MM-DD。")
 
-        orders = scrape_orders(config, start_date, end_date)
+        orders = fetch_orders(config, start_date, end_date)
         print_preview(orders)
         if args.dry_run:
             print("dry-run 模式：未生成 Excel。")
@@ -1343,6 +1911,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.write_preview:
                 write_excel(config, orders)
                 print(f"已生成本次新增数据预览：{config.output_path}")
+            if slot_for_state:
+                record_slot_success(
+                    config,
+                    slot_for_state,
+                    start_date,
+                    end_date,
+                    len(orders),
+                    backup_path if args.daily_backup else None,
+                    created if args.daily_backup else None,
+                    slot_date_for_state,
+                )
             return 0
 
         exists_text = "会覆盖已有文件" if config.output_path.exists() else "将创建新文件"
@@ -1359,8 +1938,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"已生成：{config.output_path}")
         return 0
     except ConfigError as exc:
+        record_slot_failure(config, slot_for_state, str(exc), slot_date_for_state)
         print(f"错误：{exc}", file=sys.stderr)
         return 2
+    except Exception as exc:
+        record_slot_failure(config, slot_for_state, f"{type(exc).__name__}: {exc}", slot_date_for_state)
+        print(f"未预期错误：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        stop_log_capture(log_capture)
 
 
 if __name__ == "__main__":

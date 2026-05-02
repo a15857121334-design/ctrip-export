@@ -1,7 +1,9 @@
 # 携程后台 2.0 旅游订单页面。
 order_page_url: "https://bst.ctrip.com/order_list"
+order_source: "export"
 
 storage_state_path: "storage_state.json"
+state_path: "update_state.json"
 template_path: "ctrip.xlsx"
 output_path: "new_orders_preview.xlsx"
 result_sheet_name: "ctrip"
@@ -16,7 +18,34 @@ scraping:
   wait_after_search_ms: 1200
   wait_after_page_ms: 900
 
+export:
+  download_timeout_ms: 120000
+  order_id_column: "订单号"
+  status_column: "订单状态"
+
+catch_up:
+  noon_slot: "noon"
+  evening_slot: "evening"
+  noon_due_time: "12:00"
+  evening_due_time: "18:00"
+  recent_days: 7
+
+network:
+  startup_delay_seconds: 120
+  retry_delays_seconds:
+    - 120
+    - 300
+    - 600
+  check_host: "bst.ctrip.com"
+  check_port: 443
+  check_timeout_seconds: 10
+
 filters:
+  include_order_statuses:
+    - "待确认"
+    - "已确认"
+    - "已完成"
+    - "已归档"
   exclude_order_statuses:
     - "已取消"
     - "全部退订"
@@ -24,12 +53,7 @@ filters:
 dedupe:
   enabled: true
   key_fields:
-    - "日期"
-    - "操作人"
-    - "目的地"
-    - "供应商"
-    - "团期"
-    - "人数"
+    - "__order_no"
   prefer_non_cancelled: true
   skip_existing_template: true
   existing_key_fields:
@@ -49,6 +73,7 @@ selectors:
   table_rows: ".tds_list01 > li:not(:first-child)"
   row_cells: "td, th"
 
+  export_order_button_text: "导出订单"
   next_page_button: ".ant-pagination-next"
   next_page_disabled_attribute: "aria-disabled"
   next_page_disabled_class: "ant-pagination-disabled"
@@ -114,6 +139,52 @@ field_mapping:
     regex: '同行价：([0-9,.]+)'
     type: "number"
     default: ""
+  利润:
+    type: "formula"
+  备注:
+    type: "text"
+    default: ""
+
+export_field_mapping:
+  日期:
+    column: "下单时间"
+    type: "date"
+  操作人:
+    column: "操作员"
+    transform: "operator_short"
+    type: "text"
+  来源:
+    type: "text"
+    default: ""
+  目的地:
+    column: "产品名称"
+    extra_columns:
+      - "产品类型"
+    transform: "destination"
+    type: "text"
+  供应商:
+    column: "供应商"
+    self_operated_column: "是否自营"
+    transform: "export_supplier"
+    type: "text"
+  团期:
+    column: "出行日期"
+    type: "date"
+  人数:
+    column: "人数"
+    type: "int"
+  卖价:
+    column: "合同价"
+    type: "number"
+  优惠后卖价:
+    column: "合同价"
+    type: "number"
+  结算:
+    column: "结算价"
+    type: "number"
+  加返后结算:
+    column: "结算价"
+    type: "number"
   利润:
     type: "formula"
   备注:

@@ -1,15 +1,22 @@
-# 携程订单抓取到 Excel 本地工具
+# 携程订单导出到 Excel 本地工具
 
-这个工具会读取桌面上的 `订单.xlsx` 作为只读模板，从你有权限访问的携程后台订单页抓取订单，并生成桌面文件 `ctrip.xlsx`。原始 `订单.xlsx` 不会被修改。
+这个工具在本项目目录里更新 `ctrip.xlsx`，不会上传登录态、订单表、备份或日志。
+
+当前主流程优先使用携程后台的 **导出订单** 功能：脚本进入 `bst.ctrip.com` 订单管理页，按日期筛选，点击导出订单，读取携程导出的 `.xls`，再按你的 Excel 字段规则追加到 `ctrip.xlsx`。如果以后需要，也可以把 `order_source` 改成 `dom`，退回页面列表读取方式。
 
 ## 文件说明
 
-- `config.yaml`：后台 URL、页面选择器、字段映射、模板路径和输出路径。
+- `main.py`：读取登录态，导出订单，去重、过滤、排序并写入 Excel。
 - `save_login_state.py`：打开浏览器让你手动登录，然后保存本地登录态 `storage_state.json`。
-- `main.py`：读取登录态，按日期范围抓取订单，生成 Excel。
-- `requirements.txt`：需要安装的 Python 依赖。
+- `config.yaml`：后台地址、导出按钮、字段映射、状态过滤、模板路径、补跑和网络重试设置。
+- `requirements.txt`：Python 依赖。
+- `setup_startup_catchup.ps1`：安装 Windows 登录后中午漏跑补跑任务。
+- `unregister_startup_catchup.ps1`：取消 Windows 登录后中午漏跑补跑任务。
+- `update_state.json`：本地自动更新状态，不进 Git。
+- `ctrip.xlsx`：本地订单表，不进 Git。
+- `ctrip_backup/`：按天备份目录，不进 Git。
 
-## 1. 安装依赖
+## 安装依赖
 
 在本项目目录运行：
 
@@ -19,28 +26,7 @@ python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-## 2. 修改配置
-
-打开 `config.yaml`，至少修改：
-
-- `order_page_url`：改成真实的携程后台订单管理页地址。
-- `selectors.table_rows`：订单列表每一行的 CSS 选择器。
-- 日期筛选选择器：`selectors.start_date_input`、`selectors.end_date_input`、`selectors.search_button`。
-- 字段映射：如果页面字段名和 Excel 表头不同，修改每个字段的 `header` 或 `selector`。
-
-如果无法确认页面字段，优先使用 `selector`。例如：
-
-```yaml
-field_mapping:
-  日期:
-    selector: ".order-date"
-    type: "date"
-    default: ""
-```
-
-如果页面是标准表格，也可以配置 `selectors.table_headers` 和每个字段的 `header`，脚本会按表头列序读取。
-
-## 3. 保存登录态
+## 保存登录态
 
 运行：
 
@@ -48,56 +34,75 @@ field_mapping:
 python save_login_state.py
 ```
 
-脚本会打开浏览器。你手动登录携程后台后，回到终端按提示输入 `确认`，才会写入：
+浏览器打开后手动登录携程后台。脚本只保存浏览器登录态到：
 
 ```text
 C:\Users\15857\Documents\New project\storage_state.json
 ```
 
-脚本不会保存账号密码。
+不会保存账号密码。
 
-## 4. 检查配置
-
-运行：
+## 检查配置
 
 ```powershell
 python main.py --check-config
 ```
 
-它只检查配置和本地路径，不抓取、不生成 Excel。
+这一步只检查路径、依赖和配置，不抓取、不写 Excel。
 
-## 5. 抓取预演
-
-先运行 dry-run：
+## 预览订单
 
 ```powershell
-python main.py --start-date 2026-01-01 --end-date 2026-01-31 --dry-run
+python main.py --recent-days 7 --dry-run
 ```
 
-dry-run 会进入页面抓取并打印前几行预览，但不会生成 `ctrip.xlsx`。
+dry-run 会导出并读取携程订单，打印新增数据预览，但不会写入 `ctrip.xlsx`。
 
-## 6. 正式生成 Excel
+## 正式更新
 
-确认 dry-run 结果正常后运行：
+每天自动任务使用的命令是：
 
 ```powershell
-python main.py --start-date 2026-01-01 --end-date 2026-01-31
+python main.py --recent-days 7 --update-template --daily-backup --yes --run-slot noon
+python main.py --recent-days 7 --update-template --daily-backup --yes --run-slot evening
 ```
 
-保存前脚本会显示：
+手动执行时如果不加 `--yes`，脚本会在写入前再次确认。
 
-- 只读模板路径：`C:\Users\15857\Desktop\订单.xlsx`
-- 输出文件路径：`C:\Users\15857\Desktop\ctrip.xlsx`
-- 将写入的订单行数
-- 是否会覆盖已有 `ctrip.xlsx`
+## 开机后补跑漏跑任务
 
-只有你输入 `确认` 后，才会写入 Excel。
+如果 12:00 或 18:00 自动更新没成功，Windows 登录后补跑任务会等待网络稳定，然后检查 `update_state.json`：
 
-## Excel 输出规则
+- 当天 12:00 后、18:00 前：如果今天中午没成功，自动补跑中午任务。
+- 当天 18:00 后：如果今天晚间没成功，自动补跑晚间任务。
+- 第二天 12:00 前：如果昨天晚间没成功，自动补跑昨天晚间任务。
+- 对应时段已经成功：不再补跑，避免重复运行。
 
-- 原模板 `工作表1` 会保留在新文件里，作为样例。
-- 新增工作表 `ctrip` 写入抓取订单。
-- 字段顺序固定为：`日期、操作人、来源、目的地、供应商、团期、人数、卖价、优惠后卖价、结算、加返后结算、利润、备注`。
-- `利润` 列自动写入公式：`=IF(I{row}="","",I{row}-K{row})`。
-- `日期` 和 `团期` 会尽量写成真正日期值；人数和金额会尽量转为数字。
-- 原始模板文件始终只读，不会被写回。
+安装登录后补跑任务：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\setup_startup_catchup.ps1
+```
+
+取消登录后补跑任务：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\unregister_startup_catchup.ps1
+```
+
+补跑日志会写到：
+
+```text
+C:\Users\15857\Documents\New project\logs\startup_catchup.log
+```
+
+## 数据规则
+
+- 只保留：`待确认、已确认、已完成、已归档`。
+- 排除：`已取消、全部退订`。
+- 优先用导出文件里的 `订单号` 对本次导出结果去重。
+- 再用 `ctrip.xlsx` 已有行做兜底去重，避免重复录入旧订单。
+- 写入后按下单日期排序。
+- `日期` 来自 `下单时间`，`团期` 来自 `出行日期`。
+- `卖价/优惠后卖价` 来自 `合同价`，`结算/加返后结算` 来自 `结算价`。
+- `利润` 列继续使用公式：`=IF(I{row}="","",I{row}-K{row})`。
