@@ -31,6 +31,8 @@ EXCEL_HEADERS = [
     "利润",
     "备注",
 ]
+ORDER_ID_HEADER = "订单号"
+ORDER_ID_COLUMN = len(EXCEL_HEADERS) + 1
 
 PLACEHOLDER_URL_PARTS = ("example.com", "replace-with", "TODO")
 
@@ -550,7 +552,7 @@ def network_available(config: AppConfig) -> bool:
         return False
 
 
-def wait_for_network_if_needed(config: AppConfig, enabled: bool) -> None:
+def wait_for_network_if_needed(config: AppConfig, enabled: bool, startup_catchup: bool = False) -> None:
     if not enabled:
         return
     initial_delay = int(nested(config.raw, "network", "startup_delay_seconds", default=120))
@@ -559,7 +561,10 @@ def wait_for_network_if_needed(config: AppConfig, enabled: bool) -> None:
         retry_delays = [120, 300, 600]
 
     if initial_delay > 0:
-        print(f"- 开机补跑先等待 {initial_delay} 秒，让网络和登录环境稳定。")
+        if startup_catchup:
+            print(f"- 开机/登录补跑先等待 {initial_delay} 秒，让网络和登录环境稳定。")
+        else:
+            print(f"- 执行前等待 {initial_delay} 秒，让网络和登录环境稳定。")
         time.sleep(initial_delay)
 
     attempts = len(retry_delays) + 1
@@ -1131,13 +1136,16 @@ def template_existing_orders(config: AppConfig) -> list[dict[str, Any]]:
     if sheet_name not in workbook.sheetnames:
         return []
     ws = workbook[sheet_name]
+    order_id_col = find_order_id_column(ws)
     existing: list[dict[str, Any]] = []
     for row in range(2, ws.max_row + 1):
         order = {header: ws.cell(row, col).value for col, header in enumerate(EXCEL_HEADERS, start=1)}
+        if order_id_col:
+            order["__order_no"] = normalize_text(ws.cell(row, order_id_col).value)
         non_formula_values = [
             value
             for header, value in order.items()
-            if header != "利润" and value not in ("", None)
+            if header not in {"利润", "__order_no"} and value not in ("", None)
         ]
         if non_formula_values:
             existing.append(order)
@@ -1156,18 +1164,26 @@ def skip_existing_template_orders(orders: list[dict[str, Any]], config: AppConfi
     if not isinstance(key_fields, list) or not key_fields:
         return orders
 
+    existing_order_numbers = {
+        dedupe_value(order.get("__order_no"))
+        for order in template_existing_orders(config)
+        if dedupe_value(order.get("__order_no"))
+    }
     existing_keys = {
         duplicate_key(order, key_fields)
         for order in template_existing_orders(config)
         if any(order.get(field) not in ("", None) for field in key_fields)
     }
-    if not existing_keys:
+    if not existing_keys and not existing_order_numbers:
         return orders
 
     kept: list[dict[str, Any]] = []
     skipped = 0
     for order in orders:
-        if duplicate_key(order, key_fields) in existing_keys:
+        order_no = dedupe_value(order.get("__order_no"))
+        if order_no and order_no in existing_order_numbers:
+            skipped += 1
+        elif duplicate_key(order, key_fields) in existing_keys:
             skipped += 1
         else:
             kept.append(order)
@@ -1585,6 +1601,38 @@ def copy_row_format(source_ws: Any, source_row: int, target_ws: Any, target_row:
         target_cell.protection = copy(source_cell.protection)
 
 
+def find_order_id_column(ws: Any) -> int | None:
+    for col in range(1, max(ws.max_column, ORDER_ID_COLUMN) + 1):
+        if normalize_text(ws.cell(1, col).value) == ORDER_ID_HEADER:
+            return col
+    return None
+
+
+def ensure_hidden_order_id_column(ws: Any) -> int:
+    col = find_order_id_column(ws) or ORDER_ID_COLUMN
+    header_cell = ws.cell(1, col)
+    if normalize_text(header_cell.value) != ORDER_ID_HEADER:
+        header_cell.value = ORDER_ID_HEADER
+        source_header = ws.cell(1, len(EXCEL_HEADERS))
+        if source_header.has_style:
+            header_cell._style = copy(source_header._style)
+        header_cell.font = copy(source_header.font)
+        header_cell.fill = copy(source_header.fill)
+        header_cell.border = copy(source_header.border)
+        header_cell.alignment = copy(source_header.alignment)
+        header_cell.protection = copy(source_header.protection)
+    column_letter = ws.cell(1, col).column_letter
+    ws.column_dimensions[column_letter].hidden = True
+    if not ws.column_dimensions[column_letter].width:
+        ws.column_dimensions[column_letter].width = 18
+    return col
+
+
+def sheet_value_max_col(ws: Any) -> int:
+    order_id_col = find_order_id_column(ws)
+    return max(len(EXCEL_HEADERS), order_id_col or 0)
+
+
 def prepare_result_sheet(workbook: Any, config: AppConfig) -> Any:
     template_sheet_name = nested(config.raw, "excel", "template_sheet_name", default="工作表1")
     result_sheet_name = config.raw.get("result_sheet_name") or "ctrip"
@@ -1624,11 +1672,15 @@ def write_excel(config: AppConfig, orders: list[dict[str, Any]]) -> None:
     workbook = load_workbook(config.template_path)
     result_ws = prepare_result_sheet(workbook, config)
     template_ws = workbook[nested(config.raw, "excel", "template_sheet_name", default="工作表1")]
-    max_col = len(EXCEL_HEADERS)
+    order_id_col = ensure_hidden_order_id_column(result_ws)
+    if find_order_id_column(template_ws):
+        ensure_hidden_order_id_column(template_ws)
+    max_col = max(len(EXCEL_HEADERS), order_id_col)
     end_row = max(result_ws.max_row, len(orders) + 1)
 
     for col, header in enumerate(EXCEL_HEADERS, start=1):
         result_ws.cell(1, col).value = header
+    result_ws.cell(1, order_id_col).value = ORDER_ID_HEADER
 
     for row in range(2, end_row + 1):
         for col in range(1, max_col + 1):
@@ -1647,7 +1699,9 @@ def write_excel(config: AppConfig, orders: list[dict[str, Any]]) -> None:
             else:
                 value = order.get(header)
                 cell.value = "" if value is None else value
+        result_ws.cell(offset, order_id_col).value = order.get("__order_no", "")
 
+    normalize_date_column_formats(result_ws, 2, len(orders) + 1)
     result_ws.auto_filter.ref = f"A1:M{max(1, len(orders) + 1)}"
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(config.output_path)
@@ -1720,13 +1774,19 @@ def sort_sheet_rows_by_order_date(ws: Any, start_row: int = 2, end_row: int | No
     if end_row < start_row:
         return
 
+    max_col = sheet_value_max_col(ws)
+    order_id_col = find_order_id_column(ws)
     rows: list[tuple[int, list[Any]]] = []
     for row in range(start_row, end_row + 1):
-        rows.append((row, [ws.cell(row, col).value for col in range(1, len(EXCEL_HEADERS) + 1)]))
+        rows.append((row, [ws.cell(row, col).value for col in range(1, max_col + 1)]))
 
     sorted_rows = sorted(
         rows,
-        key=lambda item: (order_date_sort_key(item[1][0]), item[0]),
+        key=lambda item: (
+            order_date_sort_key(item[1][0]),
+            dedupe_value(item[1][order_id_col - 1]) if order_id_col else "",
+            item[0],
+        ),
     )
     for target_row, (_, values) in zip(range(start_row, end_row + 1), sorted_rows):
         for col, value in enumerate(values, start=1):
@@ -1776,6 +1836,7 @@ def append_orders_to_template(config: AppConfig, orders: list[dict[str, Any]]) -
     for col, header in enumerate(EXCEL_HEADERS, start=1):
         if normalize_text(ws.cell(1, col).value) != header:
             raise ConfigError(f"订单表第 {col} 列表头不是 {header}，为避免写错列，已停止。")
+    order_id_col = ensure_hidden_order_id_column(ws)
 
     last_row = last_order_row(ws)
     start_row = last_row + 1
@@ -1787,7 +1848,7 @@ def append_orders_to_template(config: AppConfig, orders: list[dict[str, Any]]) -
         return start_row, start_row - 1
 
     sorted_orders = sort_orders_by_order_date(orders)
-    max_col = len(EXCEL_HEADERS)
+    max_col = max(len(EXCEL_HEADERS), order_id_col)
     for offset, order in enumerate(sorted_orders):
         row = start_row + offset
         copy_row_format(ws, style_source_row, ws, row, max_col)
@@ -1798,6 +1859,7 @@ def append_orders_to_template(config: AppConfig, orders: list[dict[str, Any]]) -
             else:
                 value = order.get(header)
                 cell.value = "" if value is None else value
+        ws.cell(row, order_id_col).value = order.get("__order_no", "")
 
     end_row = start_row + len(orders) - 1
     sort_sheet_rows_by_order_date(ws, 2, end_row)
@@ -1865,7 +1927,7 @@ def main(argv: list[str] | None = None) -> int:
             args.daily_backup = True
             args.yes = True
 
-        wait_for_network_if_needed(config, args.wait_for_network)
+        wait_for_network_if_needed(config, args.wait_for_network, args.catch_up_noon or args.catch_up_missed)
 
         start_date = args.start_date
         end_date = args.end_date
